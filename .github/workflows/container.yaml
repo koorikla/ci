@@ -284,7 +284,9 @@ jobs:
         if: needs.prepare.outputs.should_push == 'true'
         uses: actions/upload-artifact@v7
         with:
-          name: digests-${{ needs.prepare.outputs.image_name }}-${{ matrix.slug }}
+          # `~` cannot occur in image names: the download pattern below must not match
+          # another image of the same run whose name extends this one (app vs app-native).
+          name: digests-${{ needs.prepare.outputs.image_name }}~${{ matrix.slug }}
           path: ${{ runner.temp }}/digests/*
           if-no-files-found: error
           retention-days: 1
@@ -371,7 +373,7 @@ jobs:
       - name: Download digests
         uses: actions/download-artifact@v8
         with:
-          pattern: digests-${{ needs.prepare.outputs.image_name }}-*
+          pattern: digests-${{ needs.prepare.outputs.image_name }}~*
           path: ${{ runner.temp }}/digests
           merge-multiple: true
 
