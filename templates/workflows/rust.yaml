@@ -1,0 +1,44 @@
+# Copy to .github/workflows/ci.yaml. Docs: https://github.com/koorikla/ci
+# Platform repos pin koorikla/ci by commit SHA (`@<sha> # v1`, tracked by Renovate);
+# the platform's admission policy verifies signatures against that commit.
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ['v*']
+    paths-ignore:
+      - 'deploy/**'   # the Workload bump below must not retrigger CI
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    uses: koorikla/ci/.github/workflows/rust.yaml@v1
+    permissions:
+      contents: read
+      actions: read
+      packages: write
+      id-token: write
+      attestations: write
+      security-events: write
+    # with:
+    #   test_args: --workspace --all-features --locked
+
+  # GitOps hand-off: deploy/openchoreo/workload.yaml -> <image>:<sha>@sha256:<digest>.
+  bump:
+    needs: rust
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    uses: koorikla/ci/.github/workflows/workload-bump.yaml@v1
+    permissions:
+      contents: write
+    with:
+      image: ${{ needs.rust.outputs.image }}
+      digest: ${{ needs.rust.outputs.digest }}

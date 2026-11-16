@@ -46,6 +46,35 @@ case "${cmd}" in
 esac
 java -version 2>&1 | head -1 >&2
 
+# mvnw verifies the pinned .zip distribution only when `unzip` exists (else it
+# downloads the .tar.gz and the checksum fails). JDK images ship no unzip:
+# provide a minimal one backed by `jar`.
+if [[ "${cmd}" == "./mvnw" ]] && ! command -v unzip >/dev/null 2>&1; then
+  require_cmd jar
+  shim="$(mktemp -d "${TMPDIR:-/tmp}/unzip-shim.XXXXXX")"
+  cat >"${shim}/unzip" <<'SHIM'
+#!/bin/sh
+# Minimal `unzip [-q] FILE -d DIR` for mvnw, backed by the JDK's jar tool.
+set -eu
+file="" dir="."
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -q) ;;
+    -d) dir="$2"; shift ;;
+    *) file="$1" ;;
+  esac
+  shift
+done
+case "$file" in /*) ;; *) file="$(pwd)/$file" ;; esac
+mkdir -p "$dir" && cd "$dir" && jar xf "$file"
+for f in */bin/*; do [ -f "$f" ] && chmod +x "$f"; done
+SHIM
+  chmod +x "${shim}/unzip"
+  PATH="${shim}:${PATH}"
+  export PATH
+  log "no unzip on PATH: using a jar-backed shim for mvnw"
+fi
+
 case "${tool}" in
   maven)
     jv="${JACOCO_VERSION:-0.8.16}"

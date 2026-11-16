@@ -6,6 +6,8 @@
 ARG JDK_IMAGE=docker.io/library/eclipse-temurin:25.0.5_8-jdk-noble@sha256:80f67fb3d6f76e2d817d98a4cc2a9cf05f054d4e6adc5e2144bde671d722e63f
 
 FROM --platform=$BUILDPLATFORM ${JDK_IMAGE} AS build
+# mvnw picks the .zip distribution (whose checksum is pinned) only when unzip exists.
+RUN apt-get update && apt-get install -y --no-install-recommends unzip && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY . .
 RUN --mount=type=cache,target=/root/.m2 --mount=type=cache,target=/root/.gradle \

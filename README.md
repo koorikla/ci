@@ -1,8 +1,9 @@
 # koorikla/ci
 
 Portable build, test, scan, sign and attest **scripts** plus a multi-arch **toolbox image**
-for everything koorikla ships: Go, Next.js, Elixir/Phoenix, Ruby/Rails, Helm charts,
-Crossplane configuration packages and Crossplane providers.
+for everything koorikla ships: Go, Python, Node.js (Express, Fastify, NestJS, Nuxt,
+SvelteKit, Remix), Next.js, Rust, Java (Quarkus, Spring Boot), Elixir/Phoenix, Ruby/Rails,
+Helm charts, Crossplane configuration packages and Crossplane providers.
 
 - **Primary path: in-cluster.** OpenChoreo workflow-plane ClusterWorkflows run
   `scripts/<stack>/*.sh` and `scripts/common/*.sh` inside
@@ -36,6 +37,11 @@ their own step, then hand the pushed digest to the toolbox steps.
 |---|---|---|
 | [`container.yaml`](.github/workflows/container.yaml) | Shared building block: multi-arch buildx build, Trivy scan of every platform (SARIF → code scanning), syft SBOM, attestations, cosign sign | image `ghcr.io/<owner>/<repo>` |
 | [`go.yaml`](.github/workflows/go.yaml) | setup-go from go.mod, `go vet`, golangci-lint, `go test -race` + coverage, govulncheck, CodeQL → `container.yaml` | image |
+| [`python.yaml`](.github/workflows/python.yaml) | uv (`uv lock --check`, `uv sync --frozen`), ruff check + format, mypy (if locked), pytest + coverage, pip-audit, Trivy fs on uv.lock, CodeQL → `container.yaml` (distroless Python) | image |
+| [`node.yaml`](.github/workflows/node.yaml) | Generic Node.js (Express, Fastify, NestJS, Nuxt, SvelteKit, Remix): package manager from `packageManager` / lockfile (pnpm, yarn via corepack), frozen install, lint / typecheck / test / build scripts if present, prod-deps audit, Trivy fs, CodeQL → `container.yaml` (distroless Node.js, `start_entry`) | image |
+| [`rust.yaml`](.github/workflows/rust.yaml) | rust-toolchain.toml, `cargo fmt --check`, clippy `-D warnings`, cargo-nextest + doctests, cargo-deny, cargo-audit, Trivy fs, CodeQL, rust-cache → `container.yaml` (static musl binary on distroless/static) | image |
+| [`java.yaml`](.github/workflows/java.yaml) | Maven or Gradle (wrapper, auto-detected), Temurin 25, tests + JaCoCo, CycloneDX SBOM scanned by Trivy + osv-scanner, CodeQL → `container.yaml`: Quarkus JVM (default), opt-in Quarkus native (Mandrel, per arch), Spring Boot layered jar on distroless Java | image |
+| [`workload-bump.yaml`](.github/workflows/workload-bump.yaml) | GitOps hand-off after a stack workflow: OpenChoreo Workload `spec.container.image` → `<repo>:<sha>@sha256:<digest>`, `spec.source.commit`, commit + push `[skip ci]` | commit |
 | [`nextjs.yaml`](.github/workflows/nextjs.yaml) | setup-node (.nvmrc / .node-version / .tool-versions / engines), npm/pnpm/yarn by lockfile, lint, typecheck, test, cached `next build`, audit, Trivy fs, CodeQL → `container.yaml` | image |
 | [`elixir.yaml`](.github/workflows/elixir.yaml) | setup-beam (.tool-versions), deps/_build cache, `compile --warnings-as-errors`, `format --check-formatted`, credo, `mix test` (+ optional Postgres), sobelow, `hex.audit`, `deps.audit`, Trivy fs → `container.yaml` | image |
 | [`ruby.yaml`](.github/workflows/ruby.yaml) | setup-ruby with bundler cache, rubocop, rspec / `rails test` / `rake test` (+ optional Postgres), brakeman (Rails), bundler-audit, Trivy fs, CodeQL → `container.yaml` | image |
@@ -62,8 +68,11 @@ jobs:
 
 Ready-to-copy callers for every stack are in [`templates/workflows/`](templates/workflows),
 Dependabot configs in [`templates/dependabot/`](templates/dependabot) and Dockerfiles in
-[`templates/dockerfiles/`](templates/dockerfiles) (Go distroless cross-compiled, Elixir
-release on debian-slim, Rails/Ruby slim, Next.js standalone on distroless Node).
+[`templates/dockerfiles/`](templates/dockerfiles) (Go distroless cross-compiled, Python on
+distroless Python, generic Node.js and Next.js standalone on distroless Node, Rust static musl
+on distroless static, Quarkus JVM / Quarkus native / Spring Boot layered jar, Elixir release on
+debian-slim, Rails/Ruby slim). The callers for the new stacks (python, node, rust, java) include
+the [Workload bump](#workload-bump-gitops-hand-off) job.
 
 **Permissions matter.** A reusable workflow's jobs can never get more than the calling job
 grants; if a nested job asks for more, GitHub fails the whole run at startup
@@ -72,9 +81,10 @@ header comment of each workflow:
 
 | Workflow | Caller job permissions |
 |---|---|
-| go, nextjs, ruby, crossplane-provider | `contents: read`, `actions: read`, `packages: write`, `id-token: write`, `attestations: write`, `security-events: write` |
+| go, python, node, nextjs, rust, java, ruby, crossplane-provider | `contents: read`, `actions: read`, `packages: write`, `id-token: write`, `attestations: write`, `security-events: write` |
 | container, elixir | same without `actions: read` |
 | helm-chart, crossplane-configuration | `contents: read`, `packages: write`, `id-token: write`, `attestations: write` |
+| workload-bump | `contents: write` (only this job: it pushes the Workload commit) |
 
 `push: true` (default) only pushes on non-`pull_request` events; PRs build (amd64), test
 and scan but never push or sign. For a registry other than GHCR pass `registry:` plus the
@@ -85,6 +95,10 @@ and scan but never push or sign. For a registry other than GHCR pass `registry:`
 | Stack | Lint / static analysis | Tests | Dependency vulns | SAST | Image |
 |---|---|---|---|---|---|
 | Go | `go vet`, golangci-lint | `go test -race` + coverage | govulncheck (call-graph aware) | CodeQL go | Trivy, SBOM, sign |
+| Python | ruff check + `ruff format --check`, mypy (if locked), `uv lock --check` | pytest (+ pytest-cov coverage) | pip-audit on the exported runtime requirements (hashes), Trivy fs on uv.lock | CodeQL python | Trivy, SBOM, sign |
+| Node.js | `lint` script, `typecheck` script / `tsc --noEmit` | `test` script, `build` script | `npm audit` / `pnpm audit` / `yarn npm audit` (prod deps, `audit_level`), Trivy fs on the lockfile | CodeQL javascript-typescript | Trivy, SBOM, sign |
+| Rust | `cargo fmt --check`, clippy `-D warnings` | cargo-nextest (+ doctests) or `cargo test` | cargo-deny (advisories, bans, licenses with deny.toml, sources), cargo-audit, Trivy fs on Cargo.lock | CodeQL rust | Trivy, SBOM, sign |
+| Java (Quarkus, Spring Boot) | compile (`verify` / `build`) | JUnit via Maven/Gradle + JaCoCo line coverage | CycloneDX SBOM of the resolved runtime deps scanned by Trivy (`trivy sbom`) and osv-scanner (CVSS gate) | CodeQL java-kotlin | Trivy, SBOM, sign |
 | Next.js | `lint` script (eslint), `typecheck` script / `tsc --noEmit` | `test` script, `next build` | `npm audit` / `pnpm audit` / `yarn npm audit` (prod deps, `audit_level`), Trivy fs on the lockfile | CodeQL javascript-typescript | Trivy, SBOM, sign |
 | Elixir | `compile --warnings-as-errors`, `format --check-formatted`, credo `--strict` (if a dependency) | `mix test` (+ Postgres service) | `mix hex.audit` (retired), `mix deps.audit` (mix_audit, if a dependency), Trivy fs on mix.lock | sobelow (if a dependency, i.e. Phoenix). **CodeQL has no Elixir support.** | Trivy, SBOM, sign |
 | Ruby / Rails | rubocop (if bundled) | rspec / `bin/rails test` / `rake test` (+ Postgres) | bundler-audit, Trivy fs on Gemfile.lock | brakeman (Rails), CodeQL ruby | Trivy, SBOM, sign |
@@ -118,12 +132,18 @@ The index **and** every platform manifest are cosign-signed (`--recursive`); att
 attached to the index digest (what pods reference). Dockerfiles for compiled languages should
 cross-compile with `FROM --platform=$BUILDPLATFORM` (see the Go template); Node, Ruby and
 Elixir images build on the target platform because native modules / ERTS are arch-specific.
+Python and Rust build on the target platform too (arch-specific wheels; native musl build on each
+runner, no cross toolchain). Java JVM images (Quarkus, Spring Boot) build the jar once on
+`$BUILDPLATFORM` and copy it into each platform's distroless Java runtime; the Quarkus native
+image (Mandrel cannot cross-compile) builds on each arch's native runner.
 
 ## Signing and attestation model
 
 GitHub-built artifacts are signed **keyless** (Sigstore Fulcio + Rekor) with the job's OIDC
 token. Because signing happens inside a *reusable* workflow, the certificate identity is the
-reusable workflow, and the calling repository is recorded in certificate extensions:
+reusable workflow, and the calling repository is recorded in certificate extensions. Every
+stack workflow (go, python, node, rust, java, nextjs, elixir, ruby) signs through
+`container.yaml`, so the identity is the same for all of them:
 
 | Certificate field | Value |
 |---|---|
@@ -214,6 +234,35 @@ Kyverno (illustrative only; the real policy lives in koorikla/platform):
 cosign v3 stores signatures/attestations in the Sigstore bundle format (OCI referrers); make
 sure the Kyverno version in the platform verifies that format (see VERIFY in the platform repo).
 
+## Workload bump (GitOps hand-off)
+
+[`workload-bump.yaml`](.github/workflows/workload-bump.yaml) points the app's OpenChoreo
+Workload (`deploy/openchoreo/workload.yaml` by default) at the image the stack workflow just
+pushed and commits it back (`chore(deploy): bump <name> image to <sha> [skip ci]`):
+
+```yaml
+  bump:
+    needs: python
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    uses: koorikla/ci/.github/workflows/workload-bump.yaml@v1
+    permissions:
+      contents: write
+    with:
+      image: ${{ needs.python.outputs.image }}     # <repo>:<short sha>
+      digest: ${{ needs.python.outputs.digest }}   # index digest; '' (PRs) skips the bump
+```
+
+- `spec.container.image` becomes `<repo>:<short sha>@sha256:<index digest>` (production admission
+  only accepts digest references; the tag keeps it readable), `spec.source.commit` the built commit.
+  The edit is line-based (`scripts/common/workload-bump.sh`, bash + awk): comments survive.
+- It is a separate reusable workflow so only that job holds `contents: write`; the stack
+  workflows keep their read-only permission set (a nested job asking for more than the caller
+  grants fails the whole run at startup).
+- Push-triggered callers should `paths-ignore: ['deploy/**']`; branch protection must let the
+  job token push. `validate_command` runs a schema check before committing; `push: false` is a
+  dry run (used by the selftest).
+- In-cluster builds use the same two scripts (`workload-bump.sh`, `git-push-change.sh`).
+
 ## Registry: GHCR now, Harbor later
 
 Everything pushes to `ghcr.io/<owner>` by default. Harbor on the management cluster currently
@@ -244,7 +293,8 @@ SLSA predicate from the workflow engine, if it emits one) for SBOM/provenance at
 GitHub's `attest-*` actions have no in-cluster equivalent.
 
 Stack checks need a language toolchain the toolbox does not carry: run `check.sh` in the
-official toolchain image (`golang`, `node`, `elixir`, `ruby`, `alpine/helm`) with the scripts
+official toolchain image (`golang`, `ghcr.io/astral-sh/uv:python3.13-trixie`, `node`, `rust`,
+`eclipse-temurin:25-jdk`, `elixir`, `ruby`, `alpine/helm`) with the scripts
 mounted or copied from the toolbox (`/opt/koorikla-ci/scripts`), exactly like a developer runs
 them on a laptop. Crossplane steps (`crossplane/*.sh`) run in the toolbox itself;
 `validate-render.sh` needs a Docker-compatible runtime for `crossplane composition render`
@@ -302,8 +352,12 @@ Workflows are thin: each step calls `scripts/<stack>/*.sh` or `scripts/common/*.
 | `common/scan-fs.sh` | Trivy fs on lockfiles → JSON, SARIF, gate |
 | `common/sbom.sh` | syft SPDX JSON |
 | `common/sign-image.sh` | cosign sign (+ vuln attest), keyless or `COSIGN_KEY` |
+| `common/scan-fs.sh` with `SBOM_FILE` | `trivy sbom` on a build-generated CycloneDX SBOM (Java) |
+| `common/osv-scan.sh` | osv-scanner (pinned, checksum-verified install) on lockfiles / SBOM, CVSS gate |
+| `common/workload-bump.sh` | OpenChoreo Workload image `<repo>:<tag>@sha256:…` + source commit |
+| `common/git-push-change.sh` | commit paths if changed, push with rebase/retry |
 | `common/generate-check.sh` | code generation must leave a clean tree |
-| `go/check.sh`, `nextjs/{detect,check}.sh`, `elixir/check.sh`, `ruby/check.sh`, `helm/{check,package-push,registry-meta}.sh` | stack checks |
+| `go/check.sh`, `python/check.sh`, `node/{detect,setup-pm,check}.sh`, `nextjs/{detect,check}.sh`, `rust/check.sh`, `java/{detect,check}.sh`, `elixir/check.sh`, `ruby/check.sh`, `helm/{check,package-push,registry-meta}.sh` | stack checks |
 | `crossplane/{install-cli,package-name,validate-render,xpkg-build,xpkg-push,provider-xpkg}.sh` | Crossplane CLI, validation/render tests, packaging |
 
 ## Versioning
@@ -316,6 +370,9 @@ tag on `main`, moved only after the selftest is green; pushing it rebuilds
 git tag -f v1 <sha> && git push -f origin v1
 ```
 
+Actions in the python, node, rust, java and workload-bump workflows (and the selftest) are
+pinned by commit SHA with the release as a comment; Dependabot (`github-actions`) bumps them.
+
 Keep it lightweight: with an annotated `v1`, nested `$/` workflow references failed with
 "workflow was not found". Backwards-incompatible changes (renamed inputs, new required
 permissions) go to `v2`. Reusable workflows call siblings with `uses: $/.github/workflows/…`
@@ -326,15 +383,24 @@ consistent set of workflows and scripts.
 
 [`selftest.yaml`](.github/workflows/selftest.yaml) runs every workflow against
 [`fixtures/`](fixtures) on PRs, `workflow_dispatch`, and pushes to `main` touching
-`.github/**`, `fixtures/**` or `scripts/**`: actionlint + shellcheck, Go module, Next.js app,
-mix project (credo + mix_audit, no Phoenix so sobelow skips), Rack app (rspec, rubocop,
-bundler-audit), Helm chart (helm-unittest), Crossplane configuration (XRD + Composition with
+`.github/**`, `fixtures/**`, `scripts/**` or `tests/**`: actionlint + shellcheck, a bash 3.2
+syntax check of every script plus script unit tests ([`tests/scripts/`](tests/scripts)), Go
+module, uv project (WSGI on waitress), pnpm Fastify/TypeScript API, dependency-free Rust HTTP
+service (cargo-deny with deny.toml), Quarkus REST service (Maven; JVM and native images), Spring
+Boot service (Gradle, Kotlin DSL), Next.js app, mix project (credo + mix_audit, no Phoenix so
+sobelow skips), Rack app (rspec, rubocop, bundler-audit), a Workload bump dry run, Helm chart (helm-unittest), Crossplane configuration (XRD + Composition with
 function-go-templating + example XR + expected render), and a tiny native provider skeleton
 (generator, controller image, per-arch xpkg). Pushed artifacts:
 
 | Package | Kind |
 |---|---|
 | `ghcr.io/koorikla/ci-selftest-go` | image |
+| `ghcr.io/koorikla/ci-selftest-python` | image |
+| `ghcr.io/koorikla/ci-selftest-node` | image |
+| `ghcr.io/koorikla/ci-selftest-rust` | image |
+| `ghcr.io/koorikla/ci-selftest-java-quarkus` | image (JVM) |
+| `ghcr.io/koorikla/ci-selftest-java-quarkus-native` | image (native) |
+| `ghcr.io/koorikla/ci-selftest-java-spring` | image |
 | `ghcr.io/koorikla/ci-selftest-nextjs` | image |
 | `ghcr.io/koorikla/ci-selftest-elixir` | image |
 | `ghcr.io/koorikla/ci-selftest-ruby` | image |
@@ -344,11 +410,12 @@ function-go-templating + example XR + expected render), and a tiny native provid
 | `ghcr.io/koorikla/ci-selftest-crossplane-provider-controller` | image |
 | `ghcr.io/koorikla/ci-toolbox` | image |
 
-Local checks before pushing: `actionlint && shellcheck -x scripts/*/*.sh`.
+Local checks before pushing: `actionlint && shellcheck -x scripts/*/*.sh tests/scripts/*.sh &&
+bash tests/scripts/workload-bump.test.sh`.
 
 ## Workflow reference
 
-Secrets for every workflow: `registry_username`, `registry_password` (optional; GHCR uses
+Secrets for every workflow except workload-bump: `registry_username`, `registry_password` (optional; GHCR uses
 `GITHUB_TOKEN`).
 
 ### container.yaml
@@ -401,6 +468,141 @@ Outputs: `image`, `image_ref`, `image_repo`, `digest`, `image_digest_ref`, `shor
 | `trivy_fail` | boolean | `true` | Fail on findings at trivy_severity |
 
 Outputs: `image`, `image_ref`, `image_repo`, `digest`, `image_digest_ref`, `short_sha`
+
+### python.yaml
+
+| Input | Type | Default | Description |
+|---|---|---|---|
+| `working_directory` | string | `.` | Directory containing pyproject.toml and uv.lock |
+| `python_version` | string | `''` | Python version (default: .python-version / requires-python, installed by uv) |
+| `uv_version` | string | `''` | uv version (default: [tool.uv] required-version or latest) |
+| `run_lint` | boolean | `true` | Run ruff check + ruff format --check |
+| `run_typecheck` | string | `auto` | Run mypy: 'auto' (when locked), 'true' or 'false' |
+| `run_test` | boolean | `true` | Run pytest (coverage with pytest-cov) |
+| `test_args` | string | `''` | Extra pytest arguments |
+| `run_audit` | boolean | `true` | Run pip-audit on the runtime dependencies |
+| `audit_ignore` | string | `''` | Space-separated vulnerability IDs pip-audit ignores (accepted risks) |
+| `run_codeql` | boolean | `true` | Run CodeQL (python) |
+| `build_container` | boolean | `true` | Build/scan/sign the container image after checks |
+| `image_name` | string | `''` | Image name (default: repository name) |
+| `registry` | string | `''` | Registry prefix (default ghcr.io/<owner>) |
+| `context` | string | `''` | Docker build context (default working_directory) |
+| `dockerfile` | string | `''` | Dockerfile (default <working_directory>/Dockerfile) |
+| `platforms` | string | `linux/amd64,linux/arm64` | Comma-separated image platforms |
+| `multiarch_strategy` | string | `native` | native (per-arch runners) or qemu |
+| `build_args` | string | `''` | Newline-separated extra build-args |
+| `push` | boolean | `true` | Push, attest and sign on non-PR events |
+| `trivy_severity` | string | `CRITICAL` | Severities that fail the Trivy scans (image and lockfiles) |
+| `trivy_ignore_unfixed` | boolean | `true` | Ignore unfixed vulnerabilities |
+| `trivy_ignore_file` | string | `''` | Repo-relative .trivyignore(.yaml) with accepted risks |
+| `trivy_fail` | boolean | `true` | Fail on Trivy findings at trivy_severity |
+
+Outputs: `image`, `image_ref`, `image_repo`, `digest`, `image_digest_ref`, `short_sha`
+
+### node.yaml
+
+| Input | Type | Default | Description |
+|---|---|---|---|
+| `working_directory` | string | `.` | Directory containing package.json |
+| `node_version` | string | `''` | Node.js version (overrides .nvmrc/.node-version/.tool-versions/package.json engines) |
+| `run_lint` | boolean | `true` | Run the lint script (if defined) |
+| `run_typecheck` | boolean | `true` | Run the typecheck script (or tsc --noEmit) |
+| `run_test` | boolean | `true` | Run the test script (if defined) |
+| `lint_script` | string | `lint` | package.json script used for lint |
+| `test_script` | string | `test` | package.json script used for tests |
+| `build_script` | string | `build` | package.json script that builds the app (CI and image; skipped when undefined) |
+| `start_entry` | string | `''` | JS entry the image starts with node, relative to the app dir (START_ENTRY build arg, e.g. dist/main.js, .output/server/index.mjs, build/index.js; '' = Dockerfile default) |
+| `run_audit` | boolean | `true` | Run npm/pnpm/yarn audit of production deps |
+| `audit_level` | string | `critical` | Audit failure level: low, moderate, high, critical |
+| `run_codeql` | boolean | `true` | Run CodeQL (javascript-typescript) |
+| `build_container` | boolean | `true` | Build/scan/sign the container image after checks |
+| `image_name` | string | `''` | Image name (default: repository name) |
+| `registry` | string | `''` | Registry prefix (default ghcr.io/<owner>) |
+| `context` | string | `''` | Docker build context (default working_directory) |
+| `dockerfile` | string | `''` | Dockerfile (default <working_directory>/Dockerfile) |
+| `platforms` | string | `linux/amd64,linux/arm64` | Comma-separated image platforms |
+| `multiarch_strategy` | string | `native` | native (per-arch runners) or qemu |
+| `build_args` | string | `''` | Newline-separated extra build-args |
+| `push` | boolean | `true` | Push, attest and sign on non-PR events |
+| `trivy_severity` | string | `CRITICAL` | Severities that fail the Trivy scans (image and lockfiles) |
+| `trivy_ignore_unfixed` | boolean | `true` | Ignore unfixed vulnerabilities |
+| `trivy_ignore_file` | string | `''` | Repo-relative .trivyignore(.yaml) with accepted risks |
+| `trivy_fail` | boolean | `true` | Fail on Trivy findings at trivy_severity |
+
+Outputs: `image`, `image_ref`, `image_repo`, `digest`, `image_digest_ref`, `short_sha`
+
+### rust.yaml
+
+| Input | Type | Default | Description |
+|---|---|---|---|
+| `working_directory` | string | `.` | Crate / workspace directory (Cargo.toml, Cargo.lock, rust-toolchain.toml) |
+| `run_fmt` | boolean | `true` | Run cargo fmt --check |
+| `run_clippy` | boolean | `true` | Run cargo clippy (warnings are errors) |
+| `clippy_args` | string | `--all-targets --all-features --locked -- -D warnings` | cargo clippy arguments |
+| `test_args` | string | `--workspace --all-features --locked` | cargo nextest / cargo test arguments |
+| `run_deny` | boolean | `true` | Run cargo-deny (licenses only with a deny.toml) |
+| `run_audit` | boolean | `true` | Run cargo-audit |
+| `run_codeql` | boolean | `true` | Run CodeQL (rust) |
+| `build_container` | boolean | `true` | Build/scan/sign the container image after checks |
+| `image_name` | string | `''` | Image name (default: repository name) |
+| `registry` | string | `''` | Registry prefix (default ghcr.io/<owner>) |
+| `context` | string | `''` | Docker build context (default working_directory) |
+| `dockerfile` | string | `''` | Dockerfile (default <working_directory>/Dockerfile) |
+| `platforms` | string | `linux/amd64,linux/arm64` | Comma-separated image platforms |
+| `multiarch_strategy` | string | `native` | native (per-arch runners) or qemu |
+| `build_args` | string | `''` | Newline-separated extra build-args |
+| `push` | boolean | `true` | Push, attest and sign on non-PR events |
+| `trivy_severity` | string | `CRITICAL` | Severities that fail the Trivy scans (image and lockfiles) |
+| `trivy_ignore_unfixed` | boolean | `true` | Ignore unfixed vulnerabilities |
+| `trivy_ignore_file` | string | `''` | Repo-relative .trivyignore(.yaml) with accepted risks |
+| `trivy_fail` | boolean | `true` | Fail on Trivy findings at trivy_severity |
+
+Outputs: `image`, `image_ref`, `image_repo`, `digest`, `image_digest_ref`, `short_sha`
+
+### java.yaml
+
+| Input | Type | Default | Description |
+|---|---|---|---|
+| `working_directory` | string | `.` | Project directory (pom.xml or build.gradle[.kts]) |
+| `build_tool` | string | `auto` | auto, maven or gradle |
+| `java_version` | string | `25` | JDK version for setup-java |
+| `java_distribution` | string | `temurin` | JDK distribution for setup-java |
+| `run_tests` | boolean | `true` | Run tests (JaCoCo coverage) |
+| `build_tool_args` | string | `''` | Extra Maven/Gradle arguments for the check build (e.g. -Pci) |
+| `native` | boolean | `false` | Quarkus native image (Mandrel, per-arch native build); default Dockerfile becomes <working_directory>/Dockerfile.native |
+| `run_osv` | boolean | `true` | Run osv-scanner on the CycloneDX SBOM (gated like Trivy, on CVSS) |
+| `run_codeql` | boolean | `true` | Run CodeQL (java-kotlin) |
+| `codeql_build_mode` | string | `none` | CodeQL build mode: none (Java) or autobuild (needed for Kotlin) |
+| `build_container` | boolean | `true` | Build/scan/sign the container image after checks |
+| `image_name` | string | `''` | Image name (default: repository name) |
+| `registry` | string | `''` | Registry prefix (default ghcr.io/<owner>) |
+| `context` | string | `''` | Docker build context (default working_directory) |
+| `dockerfile` | string | `''` | Dockerfile (default <working_directory>/Dockerfile, or Dockerfile.native with native: true) |
+| `platforms` | string | `linux/amd64,linux/arm64` | Comma-separated image platforms |
+| `multiarch_strategy` | string | `native` | native (per-arch runners) or qemu |
+| `build_args` | string | `''` | Newline-separated extra build-args |
+| `push` | boolean | `true` | Push, attest and sign on non-PR events |
+| `trivy_severity` | string | `CRITICAL` | Severities that fail the Trivy scans (image and lockfiles) |
+| `trivy_ignore_unfixed` | boolean | `true` | Ignore unfixed vulnerabilities |
+| `trivy_ignore_file` | string | `''` | Repo-relative .trivyignore(.yaml) with accepted risks |
+| `trivy_fail` | boolean | `true` | Fail on Trivy findings at trivy_severity |
+
+Outputs: `image`, `image_ref`, `image_repo`, `digest`, `image_digest_ref`, `short_sha`
+
+### workload-bump.yaml
+
+| Input | Type | Default | Description |
+|---|---|---|---|
+| `image` | string | (required) | Image reference with tag, <repo>:<tag> (stack workflow output `image`) |
+| `digest` | string | (required) | Manifest-list digest sha256:... (stack workflow output `digest`; '' skips the bump) |
+| `workload_file` | string | `deploy/openchoreo/workload.yaml` | Workload manifest to update |
+| `commit_sha` | string | `''` | Source commit written to spec.source.commit (default github.sha) |
+| `branch` | string | `''` | Branch to commit to (default: the triggering branch) |
+| `commit_message` | string | `''` | Commit message (default 'chore(deploy): bump <image name> image to <tag> [skip ci]') |
+| `validate_command` | string | `''` | Optional shell command run after the edit, before committing (e.g. a schema validation) |
+| `push` | boolean | `true` | Push the commit (false = dry run: edit, commit locally, show the diff) |
+
+Outputs: `image`, `changed`, `commit_sha`
 
 ### nextjs.yaml
 
