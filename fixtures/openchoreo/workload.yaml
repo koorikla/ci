@@ -1,0 +1,28 @@
+# Selftest fixture for scripts/common/workload-bump.sh and workload-bump.yaml
+# (dry run, never pushed). Same shape as an app repo's deploy/openchoreo/workload.yaml:
+# spec.container.image (<image>:<tag>@sha256:<digest>) and spec.source.commit are
+# bumped by CI on every push to main. Do not edit them by hand.
+apiVersion: openchoreo.dev/v1alpha1
+kind: Workload
+metadata:
+  name: ci-selftest-workload
+spec:
+  owner:
+    projectName: demo
+    componentName: ci-selftest
+  source:
+    repository: https://github.com/koorikla/ci-selftest
+    branch: main
+    commit: "0000000000000000000000000000000000000000"
+  container:
+    image: ghcr.io/koorikla/ci-selftest-go:0000000@sha256:0000000000000000000000000000000000000000000000000000000000000000
+    env:
+      - key: GREETING
+        value: hello
+  endpoints:
+    http:
+      type: HTTP
+      port: 8080
+      # external = routed through the environment's external gateway; requires
+      # gateway.ingress.external on the Environment/DataPlane.
+      visibility: [external]

@@ -1,0 +1,333 @@
+name: node
+
+# Generic Node.js service or SSR app (Express, Fastify, NestJS, Nuxt,
+# SvelteKit, Remix, ...; Next.js has nextjs.yaml): package manager from
+# package.json "packageManager" / lockfile (pnpm and yarn via corepack),
+# lockfile-frozen install, the project's lint / typecheck / test / build
+# scripts when defined, production dependency audit + Trivy fs, CodeQL
+# (javascript-typescript), then container.yaml (multi-arch build on native
+# runners, scan, SBOM, provenance, keyless cosign). Expects a Dockerfile like
+# templates/dockerfiles/node.Dockerfile (distroless Node.js; build_script and
+# start_entry are passed to it as BUILD_SCRIPT / START_ENTRY build args).
+#
+# Required caller permissions:
+#   contents: read, actions: read, packages: write, id-token: write,
+#   attestations: write, security-events: write
+# Bump the OpenChoreo Workload afterwards with workload-bump.yaml.
+
+on:
+  workflow_call:
+    inputs:
+      working_directory:
+        description: 'Directory containing package.json'
+        required: false
+        type: string
+        default: '.'
+      node_version:
+        description: 'Node.js version (overrides .nvmrc/.node-version/.tool-versions/package.json engines)'
+        required: false
+        type: string
+        default: ''
+      run_lint:
+        description: 'Run the lint script (if defined)'
+        required: false
+        type: boolean
+        default: true
+      run_typecheck:
+        description: 'Run the typecheck script (or tsc --noEmit)'
+        required: false
+        type: boolean
+        default: true
+      run_test:
+        description: 'Run the test script (if defined)'
+        required: false
+        type: boolean
+        default: true
+      lint_script:
+        description: 'package.json script used for lint'
+        required: false
+        type: string
+        default: 'lint'
+      test_script:
+        description: 'package.json script used for tests'
+        required: false
+        type: string
+        default: 'test'
+      build_script:
+        description: 'package.json script that builds the app (CI and image; skipped when undefined)'
+        required: false
+        type: string
+        default: 'build'
+      start_entry:
+        description: "JS entry the image starts with node, relative to the app dir (START_ENTRY build arg, e.g. dist/main.js, .output/server/index.mjs, build/index.js; '' = Dockerfile default)"
+        required: false
+        type: string
+        default: ''
+      run_audit:
+        description: 'Run npm/pnpm/yarn audit of production deps'
+        required: false
+        type: boolean
+        default: true
+      audit_level:
+        description: 'Audit failure level: low, moderate, high, critical'
+        required: false
+        type: string
+        default: 'critical'
+      run_codeql:
+        description: 'Run CodeQL (javascript-typescript)'
+        required: false
+        type: boolean
+        default: true
+      build_container:
+        description: 'Build/scan/sign the container image after checks'
+        required: false
+        type: boolean
+        default: true
+      image_name:
+        description: 'Image name (default: repository name)'
+        required: false
+        type: string
+        default: ''
+      registry:
+        description: 'Registry prefix (default ghcr.io/<owner>)'
+        required: false
+        type: string
+        default: ''
+      context:
+        description: 'Docker build context (default working_directory)'
+        required: false
+        type: string
+        default: ''
+      dockerfile:
+        description: 'Dockerfile (default <working_directory>/Dockerfile)'
+        required: false
+        type: string
+        default: ''
+      platforms:
+        description: 'Comma-separated image platforms'
+        required: false
+        type: string
+        default: 'linux/amd64,linux/arm64'
+      multiarch_strategy:
+        description: 'native (per-arch runners) or qemu'
+        required: false
+        type: string
+        default: 'native'
+      build_args:
+        description: 'Newline-separated extra build-args'
+        required: false
+        type: string
+        default: ''
+      push:
+        description: 'Push, attest and sign on non-PR events'
+        required: false
+        type: boolean
+        default: true
+      trivy_severity:
+        description: 'Severities that fail the Trivy scans (image and lockfiles)'
+        required: false
+        type: string
+        default: 'CRITICAL'
+      trivy_ignore_unfixed:
+        description: 'Ignore unfixed vulnerabilities'
+        required: false
+        type: boolean
+        default: true
+      trivy_ignore_file:
+        description: 'Repo-relative .trivyignore(.yaml) with accepted risks'
+        required: false
+        type: string
+        default: ''
+      trivy_fail:
+        description: 'Fail on Trivy findings at trivy_severity'
+        required: false
+        type: boolean
+        default: true
+    secrets:
+      registry_username:
+        description: 'Registry username (non-GHCR registries)'
+        required: false
+      registry_password:
+        description: 'Registry password/token (non-GHCR registries)'
+        required: false
+    outputs:
+      image:
+        description: 'Image reference tagged with the short SHA'
+        value: ${{ jobs.container.outputs.image }}
+      image_ref:
+        description: 'Alias of image'
+        value: ${{ jobs.container.outputs.image_ref }}
+      image_repo:
+        description: 'Image repository without tag'
+        value: ${{ jobs.container.outputs.image_repo }}
+      digest:
+        description: 'Manifest-list digest'
+        value: ${{ jobs.container.outputs.digest }}
+      image_digest_ref:
+        description: 'Immutable <repo>@sha256:... reference'
+        value: ${{ jobs.container.outputs.image_digest_ref }}
+      short_sha:
+        description: '7-character commit SHA'
+        value: ${{ jobs.container.outputs.short_sha }}
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: install, lint, typecheck, test, build, audit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    concurrency:
+      group: node-test-${{ github.repository }}-${{ inputs.working_directory }}-${{ github.ref }}
+      cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Fetch koorikla/ci scripts (same commit as this workflow)
+        env:
+          CI_REPO: ${{ job.workflow_repository }}
+          CI_SHA: ${{ job.workflow_sha }}
+        run: |
+          d="$RUNNER_TEMP/koorikla-ci"
+          rm -rf "$d" && git init -q "$d"
+          git -C "$d" fetch -q --depth 1 "https://github.com/${CI_REPO:-koorikla/ci}.git" "${CI_SHA:-v1}"
+          git -C "$d" checkout -q FETCH_HEAD
+          echo "CI_SCRIPTS=$d/scripts" >> "$GITHUB_ENV"
+          echo "CI_OUT_DIR=$RUNNER_TEMP/ci-out" >> "$GITHUB_ENV"
+
+      - name: Detect package manager
+        id: detect
+        env:
+          WORKDIR: ${{ inputs.working_directory }}
+        run: bash "$CI_SCRIPTS/node/detect.sh"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ inputs.node_version }}
+          node-version-file: ${{ inputs.node_version == '' && steps.detect.outputs.node_version_file || '' }}
+          package-manager-cache: false
+
+      - name: Set up package manager (corepack)
+        id: pm
+        env:
+          WORKDIR: ${{ inputs.working_directory }}
+          PM: ${{ steps.detect.outputs.pm }}
+        run: bash "$CI_SCRIPTS/node/setup-pm.sh"
+
+      - name: Cache package manager store
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ steps.pm.outputs.cache_dir }}
+          key: node-${{ steps.detect.outputs.pm }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles(format('{0}/{1}', inputs.working_directory, steps.detect.outputs.lockfile != '' && steps.detect.outputs.lockfile || 'package.json')) }}
+          restore-keys: |
+            node-${{ steps.detect.outputs.pm }}-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Install, lint, typecheck, test, build, audit
+        env:
+          WORKDIR: ${{ inputs.working_directory }}
+          PM: ${{ steps.detect.outputs.pm }}
+          RUN_LINT: ${{ inputs.run_lint }}
+          RUN_TYPECHECK: ${{ inputs.run_typecheck }}
+          RUN_TEST: ${{ inputs.run_test }}
+          LINT_SCRIPT: ${{ inputs.lint_script }}
+          TEST_SCRIPT: ${{ inputs.test_script }}
+          BUILD_SCRIPT: ${{ inputs.build_script }}
+          RUN_AUDIT: ${{ inputs.run_audit }}
+          AUDIT_LEVEL: ${{ inputs.audit_level }}
+        run: bash "$CI_SCRIPTS/node/check.sh"
+
+      - name: Install Trivy
+        uses: aquasecurity/setup-trivy@81e514348e19b6112ce2a7e3ecbafe19c1e1f567 # v0.3.1
+        with:
+          cache: true
+
+      - name: Trivy fs scan of lockfiles
+        id: fsscan
+        env:
+          SCAN_PATH: ${{ inputs.working_directory }}
+          FAIL_SEVERITIES: ${{ inputs.trivy_severity }}
+          IGNORE_UNFIXED: ${{ inputs.trivy_ignore_unfixed }}
+          FAIL_ON_FINDINGS: ${{ inputs.trivy_fail }}
+          IGNORE_FILE: ${{ inputs.trivy_ignore_file }}
+          SKIP_DIRS: "**/node_modules/.cache,**/.output,**/.svelte-kit,**/.nuxt"
+        run: bash "$CI_SCRIPTS/common/scan-fs.sh"
+
+      - name: Upload Trivy fs SARIF
+        if: always() && steps.fsscan.outputs.fs_sarif != ''
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          sarif_file: ${{ steps.fsscan.outputs.fs_sarif }}
+          category: trivy-fs-node-${{ inputs.working_directory }}
+
+  codeql:
+    name: CodeQL (javascript-typescript)
+    if: inputs.run_codeql
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    concurrency:
+      group: node-codeql-${{ github.repository }}-${{ inputs.working_directory }}-${{ github.ref }}
+      cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+    permissions:
+      contents: read
+      actions: read
+      security-events: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: CodeQL init
+        uses: github/codeql-action/init@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          languages: javascript-typescript
+          build-mode: none
+          source-root: ${{ inputs.working_directory }}
+
+      - name: CodeQL analyze
+        uses: github/codeql-action/analyze@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          category: /language:javascript-typescript/${{ inputs.working_directory }}
+
+  container:
+    name: image
+    needs: [test, codeql]
+    if: >-
+      always() && inputs.build_container &&
+      needs.test.result == 'success' &&
+      (needs.codeql.result == 'success' || needs.codeql.result == 'skipped')
+    uses: $/.github/workflows/container.yaml
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+      security-events: write
+    with:
+      image_name: ${{ inputs.image_name }}
+      registry: ${{ inputs.registry }}
+      context: ${{ inputs.context != '' && inputs.context || inputs.working_directory }}
+      dockerfile: ${{ inputs.dockerfile != '' && inputs.dockerfile || format('{0}/Dockerfile', inputs.working_directory) }}
+      platforms: ${{ inputs.platforms }}
+      multiarch_strategy: ${{ inputs.multiarch_strategy }}
+      build_args: |
+        BUILD_SCRIPT=${{ inputs.build_script }}
+        ${{ inputs.start_entry != '' && format('START_ENTRY={0}', inputs.start_entry) || '' }}
+        ${{ inputs.build_args }}
+      push: ${{ inputs.push }}
+      trivy_severity: ${{ inputs.trivy_severity }}
+      trivy_ignore_unfixed: ${{ inputs.trivy_ignore_unfixed }}
+      trivy_fail: ${{ inputs.trivy_fail }}
+      trivy_ignore_file: ${{ inputs.trivy_ignore_file }}
+    secrets:
+      registry_username: ${{ secrets.registry_username }}
+      registry_password: ${{ secrets.registry_password }}

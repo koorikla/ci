@@ -1,0 +1,349 @@
+name: java
+
+# JVM service - Quarkus (recommended) or Spring Boot (plain Java works too):
+# Maven or Gradle (wrapper preferred, auto-detected), pinned Temurin JDK 25 LTS,
+# compile + tests + JaCoCo coverage, CycloneDX SBOM of the resolved runtime
+# dependencies scanned with Trivy and osv-scanner, CodeQL (java-kotlin), then
+# container.yaml: multi-arch image on native runners, scan, SBOM, provenance,
+# keyless cosign. Images (templates/dockerfiles/):
+#   - quarkus.Dockerfile: Quarkus JVM mode on distroless Java (default)
+#   - quarkus-native.Dockerfile: opt-in Quarkus native executable (Mandrel builder,
+#     built per arch on native runners); select with `native: true`
+#   - spring-boot.Dockerfile: layered Spring Boot jar on distroless Java (no buildpacks)
+# Caches: Maven repository (setup-java) or Gradle home (setup-gradle, which
+# also validates the Gradle wrapper checksum).
+#
+# Required caller permissions:
+#   contents: read, actions: read, packages: write, id-token: write,
+#   attestations: write, security-events: write
+# Bump the OpenChoreo Workload afterwards with workload-bump.yaml.
+
+on:
+  workflow_call:
+    inputs:
+      working_directory:
+        description: 'Project directory (pom.xml or build.gradle[.kts])'
+        required: false
+        type: string
+        default: '.'
+      build_tool:
+        description: 'auto, maven or gradle'
+        required: false
+        type: string
+        default: 'auto'
+      java_version:
+        description: 'JDK version for setup-java'
+        required: false
+        type: string
+        default: '25'
+      java_distribution:
+        description: 'JDK distribution for setup-java'
+        required: false
+        type: string
+        default: 'temurin'
+      run_tests:
+        description: 'Run tests (JaCoCo coverage)'
+        required: false
+        type: boolean
+        default: true
+      build_tool_args:
+        description: 'Extra Maven/Gradle arguments for the check build (e.g. -Pci)'
+        required: false
+        type: string
+        default: ''
+      native:
+        description: 'Quarkus native image (Mandrel, per-arch native build); default Dockerfile becomes <working_directory>/Dockerfile.native'
+        required: false
+        type: boolean
+        default: false
+      run_osv:
+        description: 'Run osv-scanner on the CycloneDX SBOM (gated like Trivy, on CVSS)'
+        required: false
+        type: boolean
+        default: true
+      run_codeql:
+        description: 'Run CodeQL (java-kotlin)'
+        required: false
+        type: boolean
+        default: true
+      codeql_build_mode:
+        description: "CodeQL build mode: none (Java) or autobuild (needed for Kotlin)"
+        required: false
+        type: string
+        default: 'none'
+      build_container:
+        description: 'Build/scan/sign the container image after checks'
+        required: false
+        type: boolean
+        default: true
+      image_name:
+        description: 'Image name (default: repository name)'
+        required: false
+        type: string
+        default: ''
+      registry:
+        description: 'Registry prefix (default ghcr.io/<owner>)'
+        required: false
+        type: string
+        default: ''
+      context:
+        description: 'Docker build context (default working_directory)'
+        required: false
+        type: string
+        default: ''
+      dockerfile:
+        description: 'Dockerfile (default <working_directory>/Dockerfile, or Dockerfile.native with native: true)'
+        required: false
+        type: string
+        default: ''
+      platforms:
+        description: 'Comma-separated image platforms'
+        required: false
+        type: string
+        default: 'linux/amd64,linux/arm64'
+      multiarch_strategy:
+        description: 'native (per-arch runners) or qemu'
+        required: false
+        type: string
+        default: 'native'
+      build_args:
+        description: 'Newline-separated extra build-args'
+        required: false
+        type: string
+        default: ''
+      push:
+        description: 'Push, attest and sign on non-PR events'
+        required: false
+        type: boolean
+        default: true
+      trivy_severity:
+        description: 'Severities that fail the Trivy scans (image and lockfiles)'
+        required: false
+        type: string
+        default: 'CRITICAL'
+      trivy_ignore_unfixed:
+        description: 'Ignore unfixed vulnerabilities'
+        required: false
+        type: boolean
+        default: true
+      trivy_ignore_file:
+        description: 'Repo-relative .trivyignore(.yaml) with accepted risks'
+        required: false
+        type: string
+        default: ''
+      trivy_fail:
+        description: 'Fail on Trivy findings at trivy_severity'
+        required: false
+        type: boolean
+        default: true
+    secrets:
+      registry_username:
+        description: 'Registry username (non-GHCR registries)'
+        required: false
+      registry_password:
+        description: 'Registry password/token (non-GHCR registries)'
+        required: false
+    outputs:
+      image:
+        description: 'Image reference tagged with the short SHA'
+        value: ${{ jobs.container.outputs.image }}
+      image_ref:
+        description: 'Alias of image'
+        value: ${{ jobs.container.outputs.image_ref }}
+      image_repo:
+        description: 'Image repository without tag'
+        value: ${{ jobs.container.outputs.image_repo }}
+      digest:
+        description: 'Manifest-list digest'
+        value: ${{ jobs.container.outputs.digest }}
+      image_digest_ref:
+        description: 'Immutable <repo>@sha256:... reference'
+        value: ${{ jobs.container.outputs.image_digest_ref }}
+      short_sha:
+        description: '7-character commit SHA'
+        value: ${{ jobs.container.outputs.short_sha }}
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: build, test, JaCoCo, SBOM, dependency scan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    concurrency:
+      group: java-test-${{ github.repository }}-${{ inputs.working_directory }}-${{ inputs.native }}-${{ github.ref }}
+      cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Fetch koorikla/ci scripts (same commit as this workflow)
+        env:
+          CI_REPO: ${{ job.workflow_repository }}
+          CI_SHA: ${{ job.workflow_sha }}
+        run: |
+          d="$RUNNER_TEMP/koorikla-ci"
+          rm -rf "$d" && git init -q "$d"
+          git -C "$d" fetch -q --depth 1 "https://github.com/${CI_REPO:-koorikla/ci}.git" "${CI_SHA:-v1}"
+          git -C "$d" checkout -q FETCH_HEAD
+          echo "CI_SCRIPTS=$d/scripts" >> "$GITHUB_ENV"
+          echo "CI_OUT_DIR=$RUNNER_TEMP/ci-out" >> "$GITHUB_ENV"
+
+      - name: Detect build tool and framework
+        id: detect
+        env:
+          WORKDIR: ${{ inputs.working_directory }}
+          BUILD_TOOL: ${{ inputs.build_tool }}
+          NATIVE: ${{ inputs.native }}
+        run: |
+          bash "$CI_SCRIPTS/java/detect.sh"
+          slug="$(printf '%s' "${WORKDIR}" | tr -c 'A-Za-z0-9._-' '-')"
+          echo "artifact=java-reports-${slug}-$([ "$NATIVE" = true ] && echo native || echo jvm)" >> "$GITHUB_OUTPUT"
+
+      - name: Set up JDK
+        uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6.3.0
+        with:
+          distribution: ${{ inputs.java_distribution }}
+          java-version: ${{ inputs.java_version }}
+          cache: ${{ steps.detect.outputs.build_tool == 'maven' && 'maven' || '' }}
+          cache-dependency-path: ${{ steps.detect.outputs.build_tool == 'maven' && format('{0}/**/pom.xml', inputs.working_directory) || '' }}
+
+      - name: Set up Gradle (cache, wrapper validation)
+        if: steps.detect.outputs.build_tool == 'gradle'
+        uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
+        with:
+          add-job-summary: on-failure
+
+      - name: Build, test, JaCoCo, CycloneDX SBOM
+        id: check
+        env:
+          WORKDIR: ${{ inputs.working_directory }}
+          BUILD_TOOL: ${{ steps.detect.outputs.build_tool }}
+          RUN_TESTS: ${{ inputs.run_tests }}
+          BUILD_ARGS: ${{ inputs.build_tool_args }}
+        run: bash "$CI_SCRIPTS/java/check.sh"
+
+      - name: Upload SBOM and coverage reports
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ steps.detect.outputs.artifact }}
+          path: |
+            ${{ env.CI_OUT_DIR }}/bom.cdx.json
+            ${{ inputs.working_directory }}/**/site/jacoco/
+            ${{ inputs.working_directory }}/**/reports/jacoco/
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Install Trivy
+        uses: aquasecurity/setup-trivy@81e514348e19b6112ce2a7e3ecbafe19c1e1f567 # v0.3.1
+        with:
+          cache: true
+
+      - name: Trivy scan of the SBOM (or lockfiles)
+        id: fsscan
+        env:
+          SBOM_FILE: ${{ steps.check.outputs.sbom }}
+          SCAN_PATH: ${{ inputs.working_directory }}
+          FAIL_SEVERITIES: ${{ inputs.trivy_severity }}
+          IGNORE_UNFIXED: ${{ inputs.trivy_ignore_unfixed }}
+          FAIL_ON_FINDINGS: ${{ inputs.trivy_fail }}
+          IGNORE_FILE: ${{ inputs.trivy_ignore_file }}
+          SKIP_DIRS: ${{ steps.check.outputs.sbom == '' && '**/target,**/build,**/.gradle' || '' }}
+        run: bash "$CI_SCRIPTS/common/scan-fs.sh"
+
+      - name: Upload Trivy SARIF
+        if: always() && steps.fsscan.outputs.fs_sarif != ''
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          sarif_file: ${{ steps.fsscan.outputs.fs_sarif }}
+          category: trivy-deps-java-${{ inputs.working_directory }}-${{ inputs.native && 'native' || 'jvm' }}
+
+      - name: osv-scanner (SBOM or manifests)
+        if: inputs.run_osv
+        env:
+          SCAN_TARGET: ${{ steps.check.outputs.sbom != '' && steps.check.outputs.sbom || inputs.working_directory }}
+          FAIL_SEVERITIES: ${{ inputs.trivy_severity }}
+          FAIL_ON_FINDINGS: ${{ inputs.trivy_fail }}
+        run: bash "$CI_SCRIPTS/common/osv-scan.sh"
+
+  codeql:
+    name: CodeQL (java-kotlin)
+    if: inputs.run_codeql
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    concurrency:
+      group: java-codeql-${{ github.repository }}-${{ inputs.working_directory }}-${{ inputs.native }}-${{ github.ref }}
+      cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+    permissions:
+      contents: read
+      actions: read
+      security-events: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up JDK
+        uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6.3.0
+        with:
+          distribution: ${{ inputs.java_distribution }}
+          java-version: ${{ inputs.java_version }}
+
+      - name: CodeQL init
+        uses: github/codeql-action/init@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          languages: java-kotlin
+          build-mode: ${{ inputs.codeql_build_mode }}
+          source-root: ${{ inputs.working_directory }}
+
+      - name: CodeQL autobuild
+        if: inputs.codeql_build_mode == 'autobuild'
+        uses: github/codeql-action/autobuild@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          working-directory: ${{ inputs.working_directory }}
+
+      - name: CodeQL analyze
+        uses: github/codeql-action/analyze@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          category: /language:java-kotlin/${{ inputs.working_directory }}
+
+  container:
+    name: image
+    needs: [test, codeql]
+    if: >-
+      always() && inputs.build_container &&
+      needs.test.result == 'success' &&
+      (needs.codeql.result == 'success' || needs.codeql.result == 'skipped')
+    uses: $/.github/workflows/container.yaml
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+      security-events: write
+    with:
+      image_name: ${{ inputs.image_name }}
+      registry: ${{ inputs.registry }}
+      context: ${{ inputs.context != '' && inputs.context || inputs.working_directory }}
+      dockerfile: ${{ inputs.dockerfile != '' && inputs.dockerfile || format(inputs.native && '{0}/Dockerfile.native' || '{0}/Dockerfile', inputs.working_directory) }}
+      platforms: ${{ inputs.platforms }}
+      multiarch_strategy: ${{ inputs.multiarch_strategy }}
+      build_args: ${{ inputs.build_args }}
+      push: ${{ inputs.push }}
+      trivy_severity: ${{ inputs.trivy_severity }}
+      trivy_ignore_unfixed: ${{ inputs.trivy_ignore_unfixed }}
+      trivy_fail: ${{ inputs.trivy_fail }}
+      trivy_ignore_file: ${{ inputs.trivy_ignore_file }}
+    secrets:
+      registry_username: ${{ secrets.registry_username }}
+      registry_password: ${{ secrets.registry_password }}

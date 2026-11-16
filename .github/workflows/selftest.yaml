@@ -2,6 +2,7 @@ name: selftest
 
 # Exercises every reusable workflow against fixtures/<stack>. Images go to
 # ghcr.io/koorikla/ci-selftest-<stack>.
+# Third-party actions and images in this file are pinned by commit SHA / digest.
 
 on:
   workflow_dispatch:
@@ -10,12 +11,14 @@ on:
       - '.github/**'
       - 'fixtures/**'
       - 'scripts/**'
+      - 'tests/**'
   push:
     branches: [main]
     paths:
       - '.github/**'
       - 'fixtures/**'
       - 'scripts/**'
+      - 'tests/**'
 
 concurrency:
   group: selftest-${{ github.ref }}
@@ -32,13 +35,21 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: shellcheck scripts (bash 3.2 portable)
         run: |
           shellcheck --version
-          find scripts -name '*.sh' -print0 | xargs -0 shellcheck -x -S style
+          find scripts tests -name '*.sh' -print0 | xargs -0 shellcheck -x -S style
+      - name: bash 3.2 (macOS /bin/bash) syntax check + script unit tests
+        run: |
+          docker run --rm -v "$PWD:/w" -w /w \
+            docker.io/library/bash:3.2@sha256:2556c2da19c32c1614d318645c73a7bf64d38be21cf69e98e3ca51f053983719 \
+            sh -euc 'apk add -q --no-cache git >/dev/null
+              bash --version | head -1
+              find scripts tests -name "*.sh" | while read -r f; do bash -n "$f"; done
+              for t in tests/scripts/*.test.sh; do bash "$t"; done'
       - name: actionlint
         run: |
           bash <(curl -fsSL https://raw.githubusercontent.com/rhysd/actionlint/v1.7.12/scripts/download-actionlint.bash) 1.7.12
@@ -132,3 +143,99 @@ jobs:
     with:
       working_directory: fixtures/crossplane-provider
       package_name: ci-selftest-crossplane-provider
+
+  python:
+    uses: ./.github/workflows/python.yaml
+    permissions:
+      contents: read
+      actions: read
+      packages: write
+      id-token: write
+      attestations: write
+      security-events: write
+    with:
+      working_directory: fixtures/python
+      image_name: ci-selftest-python
+
+  node:
+    uses: ./.github/workflows/node.yaml
+    permissions:
+      contents: read
+      actions: read
+      packages: write
+      id-token: write
+      attestations: write
+      security-events: write
+    with:
+      working_directory: fixtures/node
+      image_name: ci-selftest-node
+      start_entry: dist/server.js
+
+  rust:
+    uses: ./.github/workflows/rust.yaml
+    permissions:
+      contents: read
+      actions: read
+      packages: write
+      id-token: write
+      attestations: write
+      security-events: write
+    with:
+      working_directory: fixtures/rust
+      image_name: ci-selftest-rust
+
+  java-quarkus:
+    uses: ./.github/workflows/java.yaml
+    permissions:
+      contents: read
+      actions: read
+      packages: write
+      id-token: write
+      attestations: write
+      security-events: write
+    with:
+      working_directory: fixtures/java-quarkus
+      image_name: ci-selftest-java-quarkus
+
+  java-quarkus-native:
+    uses: ./.github/workflows/java.yaml
+    permissions:
+      contents: read
+      actions: read
+      packages: write
+      id-token: write
+      attestations: write
+      security-events: write
+    with:
+      working_directory: fixtures/java-quarkus
+      image_name: ci-selftest-java-quarkus-native
+      native: true
+      run_codeql: false
+
+  java-spring:
+    uses: ./.github/workflows/java.yaml
+    permissions:
+      contents: read
+      actions: read
+      packages: write
+      id-token: write
+      attestations: write
+      security-events: write
+    with:
+      working_directory: fixtures/java-spring
+      image_name: ci-selftest-java-spring
+
+  workload-bump:
+    # Dry run (push: false): edits and commits fixtures/openchoreo/workload.yaml
+    # in the runner's checkout only.
+    uses: ./.github/workflows/workload-bump.yaml
+    permissions:
+      contents: write
+    with:
+      image: ghcr.io/koorikla/ci-selftest-go:selftest
+      digest: sha256:1111111111111111111111111111111111111111111111111111111111111111
+      workload_file: fixtures/openchoreo/workload.yaml
+      branch: ${{ github.head_ref || github.ref_name }}
+      validate_command: >-
+        grep -q 'image: ghcr.io/koorikla/ci-selftest-go:selftest@sha256:1111' fixtures/openchoreo/workload.yaml
+      push: false

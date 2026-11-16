@@ -1,0 +1,18 @@
+[package]
+name = "ci-selftest-rust"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.100"
+description = "koorikla/ci selftest fixture: dependency-free HTTP service (rust.yaml)"
+license = "Apache-2.0"
+publish = false
+
+[[bin]]
+name = "ci-selftest-rust"
+path = "src/main.rs"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+panic = "abort"

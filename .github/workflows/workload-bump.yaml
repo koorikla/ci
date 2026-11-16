@@ -1,0 +1,147 @@
+name: workload-bump
+
+# GitOps hand-off: point the app's OpenChoreo Workload at the image a stack
+# workflow just pushed (<repo>:<short sha>@sha256:<index digest>; production
+# admission only accepts digest references) and the built commit, then commit
+# and push to the branch (`[skip ci]`). Skipped when `digest` is empty (PRs and
+# other non-push runs build without pushing).
+#
+#   jobs:
+#     go:
+#       uses: koorikla/ci/.github/workflows/go.yaml@<sha> # v1
+#       ...
+#     bump:
+#       needs: go
+#       if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+#       uses: koorikla/ci/.github/workflows/workload-bump.yaml@<sha> # v1
+#       permissions:
+#         contents: write
+#       with:
+#         image: ${{ needs.go.outputs.image }}
+#         digest: ${{ needs.go.outputs.digest }}
+#
+# Callers that trigger on push should ignore the Workload path
+# (`paths-ignore: ['deploy/**']`); the commit message also carries [skip ci].
+# Branch protection must allow github-actions[bot] (or the token used) to push.
+#
+# Required caller permissions:
+#   contents: write
+
+on:
+  workflow_call:
+    inputs:
+      image:
+        description: 'Image reference with tag, <repo>:<tag> (stack workflow output `image`)'
+        required: true
+        type: string
+      digest:
+        description: "Manifest-list digest sha256:... (stack workflow output `digest`; '' skips the bump)"
+        required: true
+        type: string
+      workload_file:
+        description: 'Workload manifest to update'
+        required: false
+        type: string
+        default: 'deploy/openchoreo/workload.yaml'
+      commit_sha:
+        description: 'Source commit written to spec.source.commit (default github.sha)'
+        required: false
+        type: string
+        default: ''
+      branch:
+        description: 'Branch to commit to (default: the triggering branch)'
+        required: false
+        type: string
+        default: ''
+      commit_message:
+        description: "Commit message (default 'chore(deploy): bump <image name> image to <tag> [skip ci]')"
+        required: false
+        type: string
+        default: ''
+      validate_command:
+        description: 'Optional shell command run after the edit, before committing (e.g. a schema validation)'
+        required: false
+        type: string
+        default: ''
+      push:
+        description: 'Push the commit (false = dry run: edit, commit locally, show the diff)'
+        required: false
+        type: boolean
+        default: true
+    outputs:
+      image:
+        description: 'Full reference written to the Workload (<repo>:<tag>@sha256:...)'
+        value: ${{ jobs.bump.outputs.image }}
+      changed:
+        description: 'true when the Workload changed'
+        value: ${{ jobs.bump.outputs.changed }}
+      commit_sha:
+        description: 'Commit that carries the bump (empty when unchanged)'
+        value: ${{ jobs.bump.outputs.commit_sha }}
+
+permissions:
+  contents: read
+
+jobs:
+  bump:
+    name: Bump ${{ inputs.workload_file }}
+    if: inputs.digest != ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    concurrency:
+      group: workload-bump-${{ github.repository }}-${{ inputs.workload_file }}
+      cancel-in-progress: false
+    permissions:
+      contents: write
+    outputs:
+      image: ${{ steps.edit.outputs.image }}
+      changed: ${{ steps.edit.outputs.changed }}
+      commit_sha: ${{ steps.push.outputs.commit_sha }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.branch != '' && inputs.branch || github.ref_name }}
+          # Pushing back needs the job token in the checkout's git config.
+          persist-credentials: ${{ inputs.push }}
+
+      - name: Fetch koorikla/ci scripts (same commit as this workflow)
+        env:
+          CI_REPO: ${{ job.workflow_repository }}
+          CI_SHA: ${{ job.workflow_sha }}
+        run: |
+          d="$RUNNER_TEMP/koorikla-ci"
+          rm -rf "$d" && git init -q "$d"
+          git -C "$d" fetch -q --depth 1 "https://github.com/${CI_REPO:-koorikla/ci}.git" "${CI_SHA:-v1}"
+          git -C "$d" checkout -q FETCH_HEAD
+          echo "CI_SCRIPTS=$d/scripts" >> "$GITHUB_ENV"
+          echo "CI_OUT_DIR=$RUNNER_TEMP/ci-out" >> "$GITHUB_ENV"
+
+      - name: Update image and commit
+        id: edit
+        env:
+          WORKLOAD_FILE: ${{ inputs.workload_file }}
+          IMAGE: ${{ inputs.image }}
+          DIGEST: ${{ inputs.digest }}
+          COMMIT: ${{ inputs.commit_sha != '' && inputs.commit_sha || github.sha }}
+        run: bash "$CI_SCRIPTS/common/workload-bump.sh"
+
+      - name: Validate
+        if: inputs.validate_command != ''
+        env:
+          VALIDATE_CMD: ${{ inputs.validate_command }}
+        run: bash -euo pipefail -c "$VALIDATE_CMD"
+
+      - name: Commit and push
+        id: push
+        env:
+          PATHS: ${{ inputs.workload_file }}
+          BRANCH: ${{ inputs.branch != '' && inputs.branch || github.ref_name }}
+          PUSH: ${{ inputs.push }}
+          IMAGE: ${{ inputs.image }}
+          COMMIT_MESSAGE: ${{ inputs.commit_message }}
+        run: |
+          name="${IMAGE##*/}"
+          MESSAGE="${COMMIT_MESSAGE:-chore(deploy): bump ${name%%:*} image to ${name##*:} [skip ci]}"
+          export MESSAGE
+          bash "$CI_SCRIPTS/common/git-push-change.sh"

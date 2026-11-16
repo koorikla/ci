@@ -1,9 +1,13 @@
 #!/usr/bin/env bash
 # Trivy filesystem scan of dependency lockfiles (go.sum, mix.lock,
-# Gemfile.lock, package-lock.json, pnpm-lock.yaml, yarn.lock, ...).
+# Gemfile.lock, package-lock.json, pnpm-lock.yaml, yarn.lock, uv.lock,
+# Cargo.lock, ...), or of a build-generated SBOM (SBOM_FILE, e.g. the
+# CycloneDX BOM of a Maven/Gradle build: exact resolved dependencies).
 #
 # Env in:
 #   SCAN_PATH        directory to scan, default .
+#   SBOM_FILE        optional CycloneDX/SPDX JSON; when set, `trivy sbom` scans
+#                    it instead of `trivy fs` on SCAN_PATH
 #   SCANNERS         trivy --scanners, default vuln
 #   FAIL_SEVERITIES  comma list that fails the scan, default CRITICAL
 #   IGNORE_UNFIXED   true/false, default true
@@ -42,8 +46,15 @@ if [[ -n "${SKIP_DIRS:-}" ]]; then
   set -- "$@" --skip-dirs "${SKIP_DIRS}"
 fi
 
-log "trivy fs ${path}"
-trivy fs "$@" --format json --output "${out}/trivy-fs.json" "${path}"
+if [[ -n "${SBOM_FILE:-}" ]]; then
+  [[ -f "${SBOM_FILE}" ]] || die "SBOM_FILE ${SBOM_FILE} not found"
+  path="${SBOM_FILE}"
+  log "trivy sbom ${path}"
+  trivy sbom "$@" --format json --output "${out}/trivy-fs.json" "${path}"
+else
+  log "trivy fs ${path}"
+  trivy fs "$@" --format json --output "${out}/trivy-fs.json" "${path}"
+fi
 trivy convert --quiet --format sarif --output "${out}/trivy-fs.sarif" "${out}/trivy-fs.json"
 emit_output fs_sarif "${out}/trivy-fs.sarif"
 
