@@ -1,3 +1,6 @@
+> **Archived.** Moved into [koorikla/platform](https://github.com/koorikla/platform): `ci/` (scripts, toolbox, fixtures) and
+> `.github/workflows/app-*.yaml` (reusable workflows, released as `ci-vX.Y.Z`). See koorikla/platform#213.
+
 # koorikla/ci
 
 Portable build, test, scan, sign and attest **scripts** plus a multi-arch **toolbox image**
